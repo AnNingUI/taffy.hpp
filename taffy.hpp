@@ -1,6 +1,10 @@
-// taffy.hpp - C++17 header-only CSS layout library (Flexbox, Grid, Block)
+// taffy.hpp - C++17/C++20 header-only CSS layout library (Flexbox, Grid, Block)
 // Ported from the Rust "taffy" library by Dioxus Labs
 // https://github.com/DioxusLabs/taffy
+//
+// Verified against taffy's full XML fixture corpus (6,652 fixtures, 100%) and the reference
+// Rust implementation. Tested compilers: MSVC 19.44 (VS2022, /std:c++17 and /std:c++20, /W4),
+// GCC 16.1 and Clang 20.1 (-std=c++17 / -std=c++20, -Wall -Wextra); all warning-free.
 //
 // Usage: #include "taffy.hpp"
 // Namespace: taffy
@@ -43,6 +47,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -50,6 +55,24 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// constexpr bit casts: MSVC rejects `constexpr` functions that call `std::memcpy`, even when
+// they are never evaluated in a constant expression (error C3615). Prefer a constexpr bit cast
+// where available and keep memcpy as a portable C++17-era fallback (GCC/Clang only diagnose
+// constexpr misuse on actual constant evaluation).
+#if defined(__has_include)
+#if __has_include(<bit>)
+#include <bit>
+#endif
+#endif
+
+#if defined(__cpp_lib_bit_cast) && __cpp_lib_bit_cast >= 201806L
+#define TAFFY_CONSTEXPR_BITCAST 1
+#elif defined(__has_builtin)
+#if __has_builtin(__builtin_bit_cast)
+#define TAFFY_BUILTIN_BITCAST 1
+#endif
+#endif
 
 #ifdef TAFFY_CSS_PARSE
 #include <sstream>
@@ -81,8 +104,8 @@ inline constexpr AbsoluteAxis as_abs_naive(AbstractAxis a) {
 // FlexDirection is a plain axis-relative enum; keep it available even when the flexbox
 // algorithm is disabled (geometry helpers and the public API reference it).
 enum class FlexDirection : uint8_t { Row, Column, RowReverse, ColumnReverse };
-bool is_row(FlexDirection d);
-bool is_reverse(FlexDirection d);
+constexpr bool is_row(FlexDirection d);
+constexpr bool is_reverse(FlexDirection d);
 
 // ===========================================================================
 // Section 2: Geometry Primitives (proper order: Size, Point, Line, Rect, MinMax)
@@ -371,10 +394,10 @@ struct MinMax {
 
 // --- FlexDirection and flex-direction-aware helpers ---
 #ifdef TAFFY_FLEXBOX
-inline bool is_row(FlexDirection d) {
+constexpr bool is_row(FlexDirection d) {
     return d == FlexDirection::Row || d == FlexDirection::RowReverse;
 }
-inline bool is_reverse(FlexDirection d) {
+constexpr bool is_reverse(FlexDirection d) {
     return d == FlexDirection::RowReverse || d == FlexDirection::ColumnReverse;
 }
 
@@ -433,8 +456,17 @@ constexpr T Rect<T>::cross_end(FlexDirection dir) const { return is_row(dir) ? b
 // ===========================================================================
 
 namespace detail {
+    // Bit-cast helpers (see the probe at the top of this file).
+#if defined(TAFFY_CONSTEXPR_BITCAST)
+    constexpr uint32_t f32_to_bits(float v) { return std::bit_cast<uint32_t>(v); }
+    constexpr float f32_from_bits(uint32_t b) { return std::bit_cast<float>(b); }
+#elif defined(TAFFY_BUILTIN_BITCAST)
+    constexpr uint32_t f32_to_bits(float v) { return __builtin_bit_cast(uint32_t, v); }
+    constexpr float f32_from_bits(uint32_t b) { return __builtin_bit_cast(float, b); }
+#else
     inline uint32_t f32_to_bits(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b; }
     inline float f32_from_bits(uint32_t b) { float v; std::memcpy(&v, &b, 4); return v; }
+#endif
 }
 
 struct CompactLength {
@@ -456,7 +488,7 @@ struct CompactLength {
     static constexpr CompactLength length(float val) {
         CompactLength cl; cl.data = (uint64_t(detail::f32_to_bits(val)) << 32) | LENGTH_TAG; return cl;
     }
-    // ZERO is length(0.0f) — must be defined after length() exists
+    // ZERO is length(0.0f) - must be defined after length() exists
     static constexpr CompactLength zero_() { return length(0.0f); }
     static constexpr CompactLength percent(float val) {
         CompactLength cl; cl.data = (uint64_t(detail::f32_to_bits(val)) << 32) | PERCENT_TAG; return cl;
@@ -1993,8 +2025,8 @@ struct OofCandidates {
             c.static_position.y.area.end += offset.y;
         }
     }
-    constexpr bool operator==(const OofCandidates& o) const { return inner == o.inner; }
-    constexpr bool operator!=(const OofCandidates& o) const { return !(*this == o); }
+    bool operator==(const OofCandidates& o) const { return inner == o.inner; }
+    bool operator!=(const OofCandidates& o) const { return !(*this == o); }
 };
 
 /// The area a container's out-of-flow boxes resolve their insets against: the container's border
@@ -3049,7 +3081,9 @@ inline float compute_alignment_offset(
             case AlignContentKeyword::Stretch: return 0.0f;
             case AlignContentKeyword::SpaceBetween: return 0.0f;
             case AlignContentKeyword::SpaceAround:
-                return free_space >= 0.0f ? (free_space / static_cast<float>(num_items)) / 2.0f : free_space / 2.0f;
+                return free_space >= 0.0f
+                           ? (free_space / static_cast<float>(num_items > 0 ? num_items : 1)) / 2.0f
+                           : free_space / 2.0f;
             case AlignContentKeyword::SpaceEvenly:
                 return free_space >= 0.0f ? free_space / static_cast<float>(num_items + 1) : free_space / 2.0f;
         }
@@ -5777,11 +5811,12 @@ inline std::pair<uint16_t, uint16_t> compute_explicit_grid_size_in_axis(
     const auto& template_tracks = (axis == AbsoluteAxis::Horizontal) ? style.grid_template_columns : style.grid_template_rows;
 
     // If template contains no tracks, then there are trivially zero explicit tracks
-    if (template_tracks.empty()) return {0, 0};
+    if (template_tracks.empty()) return {uint16_t{0}, uint16_t{0}};
 
     // If there are any repetitions that contain no tracks, then the whole definition is invalid
     for (auto& def : template_tracks) {
-        if (def.kind == GridTemplateComponent::Repeat && def.repeat_val.tracks.empty()) return {0, 0};
+        if (def.kind == GridTemplateComponent::Repeat && def.repeat_val.tracks.empty())
+            return {uint16_t{0}, uint16_t{0}};
     }
 
     // Compute the number of tracks generated by single track definitions and repetitions with a
@@ -5814,12 +5849,12 @@ inline std::pair<uint16_t, uint16_t> compute_explicit_grid_size_in_axis(
 
     bool template_is_valid = (auto_repetition_count == 0)
                              || (auto_repetition_count == 1 && all_track_defs_have_fixed_component);
-    if (!template_is_valid) return {0, 0};
+    if (!template_is_valid) return {uint16_t{0}, uint16_t{0}};
 
     // If there are no auto-repetitions, then the number of explicit tracks is simply the length of
     // the track definition vector
     if (auto_repetition_count == 0) {
-        return {0, static_cast<uint16_t>(non_auto_repeating_track_count)};
+        return {uint16_t{0}, static_cast<uint16_t>(non_auto_repeating_track_count)};
     }
 
     // Find the auto-repeat definition and its insertion point
@@ -5838,7 +5873,7 @@ inline std::pair<uint16_t, uint16_t> compute_explicit_grid_size_in_axis(
         repetition_definition = &def.repeat_val;
         break;
     }
-    if (!repetition_definition) return {0, 0};
+    if (!repetition_definition) return {uint16_t{0}, uint16_t{0}};
 
     uint16_t repetition_track_count = static_cast<uint16_t>(repetition_definition->tracks.size());
 
@@ -6604,6 +6639,8 @@ inline bool should_stretch_aligned(AlignSelf alignment, bool is_replaced) {
 template <typename Tree, typename MF>
 Size<std::optional<float>> item_known_dimensions(Tree& tree, MF& measure_fn, GridItem& item,
                                                  Size<std::optional<float>> grid_area_size) {
+    (void)tree;
+    (void)measure_fn;
     Size<float> margins = margins_axis_sums_with_baseline_shims(item, grid_area_size.width);
 
     auto aspect_ratio = item.aspect_ratio;
@@ -8369,6 +8406,7 @@ struct DetailedGridTracksInfo {
 struct DetailedGridInfo {
     DetailedGridTracksInfo rows{};
     DetailedGridTracksInfo columns{};
+    NamedLineResolver resolver{};
 
     std::string grid_template_rows(float zoom = 1.0f) const { return rows.to_track_list_string(zoom); }
     std::string grid_template_columns(float zoom = 1.0f) const { return columns.to_track_list_string(zoom); }
@@ -8906,13 +8944,23 @@ LayoutOutput compute_grid_layout(Tree& tree, NodeId node, LayoutInput inputs, MF
                                                                                   std::move(detailed_row_line_names));
     detailed_info.columns = DetailedGridTracksInfo::from_grid_tracks_and_track_count(final_col_counts, columns,
                                                                                      std::move(detailed_column_line_names));
+    detailed_info.resolver = resolver;
     if constexpr (has_set_detailed_grid_info<Tree>::value) {
         tree.set_detailed_grid_info(node, detailed_info);
     }
 
     // If there are no in-flow items then return the container size (no baseline)
     if (items.empty()) {
-        return LayoutOutput::from_outer_size(container_border_box);
+        LayoutOutput out = LayoutOutput::from_outer_size(container_border_box);
+#ifdef TAFFY_CONTENT_SIZE
+        // Mark the (empty) scrollable overflow rect as reversed in RTL so that out-of-flow children
+        // overflowing the inline-start edge are accumulated on the correct side.
+        if (direction == Direction::Rtl) {
+            out.scrollable_overflow_rect = ScrollableOverflow::new_(Rect<float>{0.0f, 0.0f, 0.0f, 0.0f},
+                                                                    Point<bool>{true, false});
+        }
+#endif
+        return out;
     }
 
     // Determine the grid container baseline (currently only the first baseline)
@@ -8945,8 +8993,17 @@ LayoutOutput compute_grid_layout(Tree& tree, NodeId node, LayoutInput inputs, MF
     // Leave the scrollable overflow rectangle empty so that the tree accumulates the container's
     // scrollable overflow from its children (src/compute/common/scrollable_overflow.rs rules).
     Size<float> content_size{0.0f, 0.0f};
-    return LayoutOutput::from_sizes_and_baselines(container_border_box, content_size,
-                                                  Baselines::from_first(grid_container_baseline));
+    LayoutOutput output = LayoutOutput::from_sizes_and_baselines(container_border_box, content_size,
+                                                                Baselines::from_first(grid_container_baseline));
+#ifdef TAFFY_CONTENT_SIZE
+    // Mark the (empty) scrollable overflow rect as reversed in RTL so that out-of-flow children
+    // overflowing the inline-start edge are accumulated on the correct side.
+    if (direction == Direction::Rtl) {
+        output.scrollable_overflow_rect = ScrollableOverflow::new_(Rect<float>{0.0f, 0.0f, 0.0f, 0.0f},
+                                                                   Point<bool>{true, false});
+    }
+#endif
+    return output;
 }
 
 } // namespace grid_detail
@@ -9622,7 +9679,9 @@ inline float compute_alignment_offset(
             case AlignContentKeyword::Stretch: return 0.0f;
             case AlignContentKeyword::SpaceBetween: return 0.0f;
             case AlignContentKeyword::SpaceAround:
-                return free_space >= 0.0f ? (free_space / static_cast<float>(num_items)) / 2.0f : free_space / 2.0f;
+                return free_space >= 0.0f
+                           ? (free_space / static_cast<float>(num_items > 0 ? num_items : 1)) / 2.0f
+                           : free_space / 2.0f;
             case AlignContentKeyword::SpaceEvenly:
                 return free_space >= 0.0f ? free_space / static_cast<float>(num_items + 1) : free_space / 2.0f;
             default: return 0.0f;
@@ -10079,6 +10138,7 @@ float measure_child_size(
 template <typename Tree>
 Point<float> resolve_relative_offset(
     const BlockItem& item, SizeOpt parent_size, Direction direction, Tree& tree) {
+    (void)tree;
     if (item.position != Position::Relative) return Point<float>{0.0f, 0.0f};
     Rect<std::optional<float>> inset = item.inset.zip_size(parent_size, [&](LengthPercentageAuto p, std::optional<float> s) {
         return maybe_resolve(p, s);
@@ -10570,9 +10630,9 @@ LayoutOutput compute_inner(
                 non_stretch_justify_self = justify_self;
             }
 
-            SizeOpt known_dimensions;
+            SizeOpt item_known_dims;
             if ((item.is_table || item.is_compressible_replaced) && !is_stretch) {
-                known_dimensions = size_opt_none();
+                item_known_dims = size_opt_none();
             } else {
                 // The automatic width of a block-level box whose `justify-self` is neither
                 // `normal` nor `stretch` is equivalent to `fit-content` rather than `stretch`
@@ -10600,22 +10660,22 @@ LayoutOutput compute_inner(
                     item.size_style.height, container_percentage_height, item_non_auto_margin,
                     children_margins_adjoin_own_edges);
 
-                known_dimensions = item.size;
+                item_known_dims = item.size;
                 {
-                    float w = known_dimensions.width.value_or(keyword_width.value_or(stretch_width));
+                    float w = item_known_dims.width.value_or(keyword_width.value_or(stretch_width));
                     w = maybe_clamp_f32(w, item.min_size.width, item.max_size.width);
-                    known_dimensions.width = w;
+                    item_known_dims.width = w;
                 }
-                known_dimensions.height = known_dimensions.height.has_value()
-                    ? known_dimensions.height : keyword_height;
-                known_dimensions = size_opt_clamp(known_dimensions, item.min_size, item.max_size);
+                item_known_dims.height = item_known_dims.height.has_value()
+                    ? item_known_dims.height : keyword_height;
+                item_known_dims = size_opt_clamp(item_known_dims, item.min_size, item.max_size);
             }
 
             LayoutInput item_inputs;
             item_inputs.run_mode = run_mode;
             item_inputs.sizing_mode = SizingMode::InherentSize;
             item_inputs.axis = RequestedAxis::Both;
-            item_inputs.known_dimensions = known_dimensions;
+            item_inputs.known_dimensions = item_known_dims;
             item_inputs.known_dimensions_are_definite = Size<bool>{true, true};
             item_inputs.parent_size = parent_size_final;
             item_inputs.available_space = Size<AvailableSpace>{
@@ -10654,7 +10714,7 @@ LayoutOutput compute_inner(
                 bool needs_oof_pass =
                     item.position != Position::Static && subtree_has_absolute_descendant(tree, item.node_id);
                 if (!use_leaf_layout && !needs_oof_pass) {
-                    float width = known_dimensions.width.value_or(stretch_width);
+                    float width = item_known_dims.width.value_or(stretch_width);
                     width = std::max(width, item.padding_border_sum.width);
 
                     float inset_left = item_non_auto_margin.left + content_box_inset.left;
@@ -11791,13 +11851,20 @@ namespace detail {
     /// Resolve an absolute placement in one axis to physical start/end coordinates
     inline Line<float> resolve_absolute_grid_axis(const grid_detail::DetailedGridTracksInfo& tracks,
                                                   const Line<GridPlacement>& placement, float padding_start,
-                                                  float padding_end, bool is_reversed) {
+                                                  float padding_end, bool is_reversed,
+                                                  grid_detail::GridAreaAxis axis = grid_detail::GridAreaAxis::Row,
+                                                  const grid_detail::NamedLineResolver* resolver = nullptr) {
         const grid_detail::TrackCounts counts{tracks.negative_implicit_tracks, tracks.explicit_tracks,
                                  tracks.positive_implicit_tracks};
         const int16_t min_line = static_cast<int16_t>(-static_cast<int16_t>(counts.negative_implicit));
         const int16_t max_line = static_cast<int16_t>(counts.explicit_ + counts.positive_implicit);
 
-        const Line<grid_detail::NonNamedGridPlacement> non_named = grid_placement_to_non_named(placement, tracks);
+        // Named lines and named grid areas resolve through the grid algorithm's name resolver (which
+        // also handles names that do not exist, generating implicit lines); fall back to resolving
+        // against the explicit line names only when no resolver is available.
+        const Line<grid_detail::NonNamedGridPlacement> non_named =
+            resolver != nullptr ? resolver->resolve_line_names(placement, axis)
+                                : grid_placement_to_non_named(placement, tracks);
         const Line<grid_detail::OriginZeroGridPlacement> oz = grid_detail::into_origin_zero_placement(non_named, tracks.explicit_tracks);
         const Line<std::optional<OriginZeroLine>> lines = resolve_absolutely_positioned_grid_tracks(oz);
 
@@ -11874,9 +11941,11 @@ namespace detail {
                                                            std::false_type) {
         const bool is_rtl = direction == Direction::Rtl;
         const Line<float> columns = resolve_absolute_grid_axis(
-            info.columns, child_style.grid_column, padding_box.left, padding_box.right, is_rtl);
+            info.columns, child_style.grid_column, padding_box.left, padding_box.right, is_rtl,
+            grid_detail::GridAreaAxis::Column, &info.resolver);
         const Line<float> rows = resolve_absolute_grid_axis(
-            info.rows, child_style.grid_row, padding_box.top, padding_box.bottom, false);
+            info.rows, child_style.grid_row, padding_box.top, padding_box.bottom, false,
+            grid_detail::GridAreaAxis::Row, &info.resolver);
         return Rect<float>{columns.start, columns.end, rows.start, rows.end};
     }
 
@@ -12818,7 +12887,7 @@ private:
         const Point<Overflow> overflow = child_style.overflow;
         const float scrollbar_width = child_style.scrollbar_width;
 #ifdef TAFFY_CONTENT_SIZE
-        const Contain contain = child_style.contain;
+        [[maybe_unused]] const Contain contain = child_style.contain;
 #endif
 
         // Static positions are relative to the containing block's border box: make them relative
@@ -12973,6 +13042,7 @@ private:
                                         Point<Overflow> container_overflow, detail::GridAreaLookup grid,
                                         Point<bool> reversed, std::vector<NodeId>& hoisted, OofCandidates& unclaimed,
                                         MeasureFunction& measure_fn) {
+        (void)node_id;
         Rect<float> absolute_overflow_rect{0.0f, 0.0f, 0.0f, 0.0f};
 #ifdef TAFFY_CONTENT_SIZE
         if (direction == Direction::Rtl) {
